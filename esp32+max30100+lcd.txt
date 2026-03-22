@@ -1,0 +1,86 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include <LiquidCrystal_I2C.h>   // ⭐ THÊM THƯ VIỆN LCD I2C ⭐
+
+#define REPORTING_PERIOD_MS 1000
+
+PulseOximeter pox;
+uint32_t tsLastReport = 0;
+
+// LCD 16x2 địa chỉ 0x27
+LiquidCrystal_I2C lcd(0x27, 16, 2);   // ⭐ THÊM LCD ⭐
+
+// Callback khi phát hiện nhịp tim
+void onBeatDetected() {
+  Serial.println("Nhịp tim được phát hiện!");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Bat dau test MAX30100...");
+
+  // I2C với SDA=21, SCL=22
+  Wire.begin(21, 22);
+
+  // ⭐ KHỞI ĐỘNG LCD ⭐
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Khoi dong...");
+
+  if (!pox.begin()) {
+    Serial.println("Khong tim thay MAX30100!");
+    
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MAX30100 ERR!");
+
+    while (1); // Dừng nếu không tìm thấy
+  } else {
+    Serial.println("Da ket noi voi MAX30100.");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("MAX30100 OK");
+  }
+
+  // Cài đặt LED IR
+  pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+
+  // Gắn callback
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+}
+
+void loop() {
+  pox.update();
+
+  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
+
+    float rawBPM = pox.getHeartRate();
+    float bpm_div2 = rawBPM / 2.2;
+
+    float spo2 = pox.getSpO2();
+
+    // --- GHI LEN SERIAL ---
+    Serial.print("Nhip tim: ");
+    Serial.print(bpm_div2);
+    Serial.print(" bpm | SpO2: ");
+    Serial.print(spo2);
+    Serial.println(" %");
+
+    // --- HIỂN THỊ LÊN LCD ---
+    lcd.clear();
+
+    lcd.setCursor(0, 0);
+    lcd.print("BPM: ");
+    lcd.print(bpm_div2);
+
+    lcd.setCursor(0, 1);
+    lcd.print("SpO2: ");
+    lcd.print(spo2);
+    lcd.print(" %");
+
+    tsLastReport = millis();
+  }
+}

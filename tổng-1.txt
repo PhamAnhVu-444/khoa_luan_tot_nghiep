@@ -1,0 +1,335 @@
+/*  ESP32 Unified Sketch - FIXED
+    - DHT11 (pin 5) -> temperature & humidity
+    - DS18B20 (pin 4) -> temperature C & F
+    - PIR HC-SR501 (pin 2) -> motion
+    - MAX30100 (I2C SDA=21, SCL=22) -> BPM + SpO2, non-blocking
+    - LCD I2C 0x27 (16x2)
+    - Buttons: NEXT = GPIO16, PREV = GPIO17 (use INPUT_PULLUP, active LOW)
+    - Firebase: send ALL sensors every 5 seconds
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include <DHT.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+#include "MAX30100_PulseOximeter.h"
+#include <LiquidCrystal_I2C.h> // ESP32-ready
+
+// ===================== User WiFi & Firebase =====================
+#define WIFI_SSID "PHAMANHVU-04 4637"
+#define WIFI_PASSWORD "494^3iL2"
+
+#define API_KEY "AIzaSyCUohMtucrJMyNtNwPw3GQLUY4BOeoobww"
+#define DATABASE_URL "https://moi-40b08-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+// Firebase objects
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+// -------------------- DHT11 setup --------------------
+#define DHT_SENSOR_PIN 5
+#define DHT_SENSOR_TYPE DHT11
+DHT dht_sensor(DHT_SENSOR_PIN, DHT_SENSOR_TYPE);
+
+// -------------------- DS18B20 setup --------------------
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors_DS18(&oneWire);
+
+// -------------------- PIR setup --------------------
+const int pirPin = 2; // HC-SR501
+
+// -------------------- MAX30100 setup --------------------
+PulseOximeter pox;
+#define REPORTING_PERIOD_MS 1000
+uint32_t tsLastReport = 0;
+const int buzzerPin = 23;
+unsigned long lastBuzzerUpdate = 0;
+int buzzerFreq = 600;
+bool buzzerIncreasing = true;
+
+// -------------------- LCD I2C --------------------
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// -------------------- Buttons (NEXT / PREV) --------------------
+const int btnNextPin = 16; 
+const int btnPrevPin = 17;
+unsigned long lastDebounceTimeNext = 0;
+unsigned long lastDebounceTimePrev = 0;
+const unsigned long debounceDelay = 50; 
+int lastBtnNextState = HIGH;
+int lastBtnPrevState = HIGH;
+int btnNextState = HIGH;
+int btnPrevState = HIGH;
+
+// Selected sensor index
+enum SensorIndex { S_DHT11 = 0, S_DS18B20 = 1, S_PIR = 2, S_MAX30100 = 3 };
+int currentSensor = S_DHT11;
+
+// Timing for Firebase send
+unsigned long sendDataPrevMillis = 0;
+const unsigned long sendInterval = 5000;
+
+// Storage of last read values
+float last_dht_temp = NAN;
+float last_dht_hum = NAN;
+float last_ds18_tempC = NAN;
+float last_ds18_tempF = NAN;
+int last_pir_motion = 0;
+float last_bpm = NAN;
+float last_spo2 = NAN;
+
+// ----------------------------------------------------------------
+// Buzzer wrapper using tone() for ESP32
+void playBuzzerTone(int freq) {
+  tone(buzzerPin, freq);
+}
+void stopBuzzer() {
+  noTone(buzzerPin);
+}
+
+// ----------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  pinMode(btnNextPin, INPUT_PULLUP);
+  pinMode(btnPrevPin, INPUT_PULLUP);
+  pinMode(pirPin, INPUT);
+  pinMode(buzzerPin, OUTPUT);
+  digitalWrite(buzzerPin, LOW);
+
+  // Sensors init
+  dht_sensor.begin();
+  sensors_DS18.begin();
+
+  // I2C
+  Wire.begin(21, 22); 
+
+  // LCD init
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Khoi dong...");
+
+  // MAX30100 init
+  if (!pox.begin()) {
+    lcd.clear();
+    lcd.print("MAX30100 ERR!");
+    Serial.println("MAX30100 begin failed!");
+  } else {
+    pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+    pox.setOnBeatDetectedCallback([](){
+      Serial.println("Nhịp tim được phát hiện!");
+    });
+  }
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+
+  if (Firebase.signUp(&config, &auth, "", "")) {
+    Serial.println("Firebase sign-up OK");
+    signupOK = true;
+  } else {
+    Serial.printf("Sign-up error: %s\n", config.signer.signupError.message.c_str());
+  }
+
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true);
+
+  lcd.clear();
+  lcd.print("Ready - Sensor 1");
+  lcd.setCursor(0,1);
+  lcd.print("DHT11");
+  delay(800);
+  lcd.clear();
+}
+
+// -------------------- Button handling --------------------
+void checkButtons() {
+  int readingNext = digitalRead(btnNextPin);
+  int readingPrev = digitalRead(btnPrevPin);
+
+  // NEXT
+  if (readingNext != lastBtnNextState) lastDebounceTimeNext = millis();
+  if ((millis() - lastDebounceTimeNext) > debounceDelay) {
+    if (readingNext != btnNextState) {
+      btnNextState = readingNext;
+      if (btnNextState == LOW) {
+        currentSensor++;
+        if (currentSensor > S_MAX30100) currentSensor = S_DHT11;
+        lcd.clear();
+        switch (currentSensor) {
+          case S_DHT11: lcd.print("DHT11"); break;
+          case S_DS18B20: lcd.print("DS18B20"); break;
+          case S_PIR: lcd.print("PIR HC-SR501"); break;
+          case S_MAX30100: lcd.print("MAX30100"); break;
+        }
+      }
+    }
+  }
+  lastBtnNextState = readingNext;
+
+  // PREV
+  if (readingPrev != lastBtnPrevState) lastDebounceTimePrev = millis();
+  if ((millis() - lastDebounceTimePrev) > debounceDelay) {
+    if (readingPrev != btnPrevState) {
+      btnPrevState = readingPrev;
+      if (btnPrevState == LOW) {
+        currentSensor--;
+        if (currentSensor < S_DHT11) currentSensor = S_MAX30100;
+        lcd.clear();
+        switch (currentSensor) {
+          case S_DHT11: lcd.print("DHT11"); break;
+          case S_DS18B20: lcd.print("DS18B20"); break;
+          case S_PIR: lcd.print("PIR HC-SR501"); break;
+          case S_MAX30100: lcd.print("MAX30100"); break;
+        }
+      }
+    }
+  }
+  lastBtnPrevState = readingPrev;
+}
+
+// -------------------- Read sensors --------------------
+void readDHT11() {
+  float t = dht_sensor.readTemperature();
+  float h = dht_sensor.readHumidity();
+  if (!isnan(t) && !isnan(h)) {
+    last_dht_temp = t;
+    last_dht_hum = h;
+    Serial.printf("DHT11 -> T: %.2f C, H: %.2f %%\n", t, h);
+  }
+}
+
+void readDS18B20() {
+  sensors_DS18.requestTemperatures();
+  float tempC = sensors_DS18.getTempCByIndex(0);
+  if (tempC != DEVICE_DISCONNECTED_C) {
+    last_ds18_tempC = tempC;
+    last_ds18_tempF = sensors_DS18.toFahrenheit(tempC);
+    Serial.printf("DS18B20 -> %.2f C | %.2f F\n", last_ds18_tempC, last_ds18_tempF);
+  }
+}
+
+void readPIR() {
+  int val = digitalRead(pirPin);
+  last_pir_motion = (val == HIGH) ? 1 : 0;
+  Serial.println(last_pir_motion ? "PIR: Motion detected" : "PIR: No motion");
+}
+
+void readMAX30100() {
+  pox.update();
+  float bpm = pox.getHeartRate();
+  float spo2 = pox.getSpO2();
+  if (!isnan(bpm)) last_bpm = bpm / 2.2;
+  if (!isnan(spo2)) last_spo2 = spo2;
+  Serial.printf("MAX30100 -> BPM: %.2f | SpO2: %.2f\n", last_bpm, last_spo2);
+
+  // Buzzer non-blocking
+  if (!isnan(last_bpm) && last_bpm > 120) {
+    if (millis() - lastBuzzerUpdate > 5) {
+      playBuzzerTone(buzzerFreq);
+      if (buzzerIncreasing) {
+        buzzerFreq += 10;
+        if (buzzerFreq >= 1200) buzzerIncreasing = false;
+      } else {
+        buzzerFreq -= 10;
+        if (buzzerFreq <= 600) buzzerIncreasing = true;
+      }
+      lastBuzzerUpdate = millis();
+    }
+  } else {
+    stopBuzzer();
+    buzzerFreq = 600;
+    buzzerIncreasing = true;
+  }
+}
+
+// -------------------- Firebase send --------------------
+void sendAllToFirebase() {
+  // DHT11
+  if (!isnan(last_dht_temp))
+    Firebase.RTDB.setFloat(&fbdo, "DHT11/Nhiet_do_moi_truong", last_dht_temp);
+  if (!isnan(last_dht_hum))
+    Firebase.RTDB.setFloat(&fbdo, "DHT11/Do_am_moi_truong", last_dht_hum);
+  // DS18B20
+  if (!isnan(last_ds18_tempC))
+    Firebase.RTDB.setFloat(&fbdo, "DS18B20/Temp_C", last_ds18_tempC);
+  if (!isnan(last_ds18_tempF))
+    Firebase.RTDB.setFloat(&fbdo, "DS18B20/Temp_F", last_ds18_tempF);
+  // PIR
+  Firebase.RTDB.setInt(&fbdo, "PIR/Motion", last_pir_motion);
+  // MAX30100
+  if (!isnan(last_bpm))
+    Firebase.RTDB.setFloat(&fbdo, "MAX30100/BPM", last_bpm);
+  if (!isnan(last_spo2))
+    Firebase.RTDB.setFloat(&fbdo, "MAX30100/SpO2", last_spo2);
+}
+
+// -------------------- LCD --------------------
+void displayCurrentSensor() {
+  lcd.clear();
+  switch (currentSensor) {
+    case S_DHT11:
+      lcd.print("DHT11");
+      lcd.setCursor(0,1);
+      if (!isnan(last_dht_temp) && !isnan(last_dht_hum))
+        lcd.printf("T:%.1fC H:%.1f%%", last_dht_temp, last_dht_hum);
+      else lcd.print("No data");
+      break;
+    case S_DS18B20:
+      lcd.print("DS18B20");
+      lcd.setCursor(0,1);
+      if (!isnan(last_ds18_tempC))
+        lcd.printf("%.2fC %.2fF", last_ds18_tempC, last_ds18_tempF);
+      else lcd.print("No data");
+      break;
+    case S_PIR:
+      lcd.print("PIR HC-SR501");
+      lcd.setCursor(0,1);
+      lcd.print(last_pir_motion ? "Motion: YES" : "Motion: NO ");
+      break;
+    case S_MAX30100:
+      lcd.print("MAX30100");
+      lcd.setCursor(0,1);
+      if (!isnan(last_bpm) && !isnan(last_spo2))
+        lcd.printf("BPM:%.0f S:%.0f%%", last_bpm, last_spo2);
+      else lcd.print("No data");
+      break;
+  }
+}
+
+// -------------------- Main loop --------------------
+void loop() {
+  checkButtons();
+
+  // Read sensors with timing control
+  static unsigned long lastDHTRead = 0;
+  if (millis() - lastDHTRead > 2000 || lastDHTRead == 0) { readDHT11(); lastDHTRead = millis(); }
+  static unsigned long lastDS18Read = 0;
+  if (millis() - lastDS18Read > 1000 || lastDS18Read == 0) { readDS18B20(); lastDS18Read = millis(); }
+  readPIR();
+  readMAX30100();
+
+  // LCD update
+  static unsigned long lastLCDUpdate = 0;
+  if (millis() - lastLCDUpdate > 500) { displayCurrentSensor(); lastLCDUpdate = millis(); }
+
+  // Firebase send
+  if (Firebase.ready() && signupOK && (millis() - sendDataPrevMillis > sendInterval || sendDataPrevMillis==0)) {
+    sendDataPrevMillis = millis();
+    sendAllToFirebase();
+  }
+
+  delay(10);
+}

@@ -1,0 +1,55 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+
+#define REPORTING_PERIOD_MS 1000
+
+PulseOximeter pox;
+uint32_t tsLastReport = 0;
+
+// Callback khi phát hiện nhịp tim
+void onBeatDetected() {
+  Serial.println("Nhịp tim được phát hiện!");
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Bat dau test MAX30100...");
+
+  // I2C với SDA=21, SCL=22
+  Wire.begin(21, 22);
+
+  if (!pox.begin()) {
+    Serial.println("Khong tim thay MAX30100!");
+    while (1); // Dừng nếu không tìm thấy
+  } else {
+    Serial.println("Da ket noi voi MAX30100.");
+  }
+
+  // Cài đặt LED IR
+  pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+
+  // Gắn callback
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+}
+
+void loop() {
+  // Hàm này phải gọi liên tục, không được delay lâu
+  pox.update();
+
+  // In giá trị mỗi giây
+  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
+
+    float rawBPM = pox.getHeartRate();
+    float bpm_div2 = rawBPM / 2.0;   // ⭐ CHIA ĐÔI BPM ⭐
+
+    Serial.print("Heart Rate (raw): ");
+    Serial.print(rawBPM);
+    Serial.print(" | Heart Rate (/2): ");
+    Serial.print(bpm_div2);
+    Serial.print(" bpm | SpO2: ");
+    Serial.print(pox.getSpO2());
+    Serial.println(" %");
+
+    tsLastReport = millis();
+  }
+}

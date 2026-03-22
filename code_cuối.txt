@@ -1,0 +1,329 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <Firebase_ESP_Client.h>
+#include "MAX30100_PulseOximeter.h"
+#include "DHT.h"
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LiquidCrystal_I2C.h>
+
+// ========================= DHT11 =========================
+#define DHTPIN 5
+#define DHTTYPE DHT11
+DHT dht(DHTPIN, DHTTYPE);
+float dhtTemp = 0;
+float dhtHum = 0;
+
+// ========================= DS18B20 =========================
+#define ONE_WIRE_BUS 4
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature ds18b20(&oneWire);
+float dsTempC = 0;
+float dsTempF = 0;
+
+// ========================= PIR SENSOR =======================
+const int pirPin = 2;
+const int ledPin = 18;
+int pirState = 0;
+
+// ========================= BUZZER ==========================
+const int buzzerPin = 23;
+volatile bool buzzerActive = false;
+
+// ========================= MAX30100 ======================
+#define POX_REPORT_MS 1000
+PulseOximeter pox;
+uint8_t heartRate = 0;
+uint8_t spo2 = 0;
+uint32_t lastPoxReport = 0;
+
+// ========================= WIFI & FIREBASE ======================
+#include "addons/TokenHelper.h"
+#include "addons/RTDBHelper.h"
+
+#define WIFI_SSID "PHAMANHVU-04 4637"
+#define WIFI_PASSWORD "494^3iL2"
+
+#define API_KEY "AIzaSyCUohMtucrJMyNtNwPw3GQLUY4BOeoobww"
+#define DATABASE_URL "https://moi-40b08-default-rtdb.asia-southeast1.firebasedatabase.app/"
+
+FirebaseData fbdo;
+FirebaseAuth auth;
+FirebaseConfig config;
+bool signupOK = false;
+
+// ========================= LCD & Buttons ======================
+LiquidCrystal_I2C lcd(0x27,16,2);
+const int btnNext = 16;
+const int btnPrev = 17;
+int sensorIndex = 0;
+const int totalSensors = 4;
+
+// ========================= LED RGB =========================
+const int ledR = 12;
+const int ledG = 13;
+const int ledB = 14;
+
+// ========================= TASK HANDLES ======================
+TaskHandle_t TaskReadSensor;
+TaskHandle_t TaskSendFirebase;
+TaskHandle_t TaskBuzzer;
+TaskHandle_t TaskLCD;
+
+// ====================== CALLBACK ==========================
+void onBeatDetected() {
+  Serial.println(">>> Beat detected!");
+}
+
+// ====================== MAX30100 TASK (Core 0) ======================
+void Task_ReadSensor(void *parameter) {
+  (void) parameter;
+  for (;;) {
+    pox.update();
+
+    if (millis() - lastPoxReport > POX_REPORT_MS) {
+      heartRate = round(pox.getHeartRate());
+      spo2 = round(pox.getSpO2());
+
+      Serial.print("[MAX30100] HR = ");
+      Serial.print(heartRate);
+      Serial.print(" bpm | SpO2 = ");
+      Serial.print(spo2);
+      Serial.println(" %");
+
+      // Bật / tắt buzzer nếu HR > 120
+      buzzerActive = (heartRate > 120);
+
+      lastPoxReport = millis();
+    }
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+// ====================== Firebase + DHT11 + DS18B20 + PIR TASK (Core 1) ======================
+void Task_SendFirebase(void *parameter) {
+  (void) parameter;
+  for (;;) {
+    // DHT11
+    float t = dht.readTemperature();
+    float h = dht.readHumidity();
+    if (!isnan(t)) dhtTemp = t;
+    if (!isnan(h)) dhtHum = h;
+
+    // DS18B20
+    ds18b20.requestTemperatures();
+    dsTempC = ds18b20.getTempCByIndex(0);
+    if (dsTempC != DEVICE_DISCONNECTED_C) {
+      dsTempF = dsTempC * 9.0 / 5.0 + 32.0;
+    } else {
+      dsTempC = 0;
+      dsTempF = 0;
+    }
+
+    // PIR
+    pirState = digitalRead(pirPin);
+    digitalWrite(ledPin, pirState);
+
+    // Gửi Firebase
+    if (Firebase.ready() && signupOK) {
+      Firebase.RTDB.setInt(&fbdo, "MAX30100/HeartRate", heartRate);
+      Firebase.RTDB.setInt(&fbdo, "MAX30100/SpO2", spo2);
+      Firebase.RTDB.setFloat(&fbdo, "DHT11/Temperature", dhtTemp);
+      Firebase.RTDB.setFloat(&fbdo, "DHT11/Humidity", dhtHum);
+      Firebase.RTDB.setFloat(&fbdo, "DS18B20/TemperatureC", dsTempC);
+      Firebase.RTDB.setFloat(&fbdo, "DS18B20/TemperatureF", dsTempF);
+      Firebase.RTDB.setString(&fbdo, "PIR/Motion", pirState ? "Co nguoi" : "Khong co nguoi");
+    }
+
+    vTaskDelay(5000 / portTICK_PERIOD_MS);
+  }
+}
+
+// ====================== Buzzer Task ======================
+void buzzerTask(void * parameter) {
+  (void) parameter;
+  pinMode(buzzerPin, OUTPUT);
+  while (true) {
+    if (buzzerActive) {
+      tone(buzzerPin, 1500);
+    } else {
+      noTone(buzzerPin);
+    }
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+  }
+}
+
+// ====================== LCD & RGB Helpers ======================
+unsigned long lastLCDUpdate = 0;
+const unsigned long lcdInterval = 400;
+
+void displaySensorRealtime() {
+  switch(sensorIndex){
+    case 0: // MAX30100
+      lcd.setCursor(0,0);
+      lcd.print("MAX30100 HR/SpO2  ");
+      lcd.setCursor(0,1);
+      lcd.print("HR:");
+      if (heartRate < 10) lcd.print(" ");
+      lcd.print(heartRate);
+      lcd.print(" bpm ");
+      if (spo2 < 10) lcd.print(" ");
+      lcd.print(spo2);
+      lcd.print("%  ");
+      break;
+
+    case 1: // DHT11
+      lcd.setCursor(0,0);
+      lcd.print("DHT11 Temp/Hum   ");
+      lcd.setCursor(0,1);
+      lcd.print(dhtTemp,1);
+      lcd.print("C ");
+      lcd.print(dhtHum,1);
+      lcd.print("%    ");
+      break;
+
+    case 2: // DS18B20
+      lcd.setCursor(0,0);
+      lcd.print("DS18B20 Temp     ");
+      lcd.setCursor(0,1);
+      lcd.print(dsTempC,1);
+      lcd.print("C ");
+      lcd.print(dsTempF,1);
+      lcd.print("F    ");
+      break;
+
+    case 3: // PIR
+      lcd.setCursor(0,0);
+      lcd.print("PIR Sensor       ");
+      lcd.setCursor(0,1);
+      if (pirState) lcd.print("Co nguoi         ");
+      else lcd.print("Khong co nguoi   ");
+      break;
+  }
+}
+
+// Cập nhật LED RGB theo sensorIndex
+void updateLED(int index) {
+  switch(index) {
+    case 0: // MAX30100 - RED
+      digitalWrite(ledR,HIGH); digitalWrite(ledG,LOW); digitalWrite(ledB,LOW);
+      break;
+    case 1: // DHT11 - GREEN
+      digitalWrite(ledR,LOW); digitalWrite(ledG,HIGH); digitalWrite(ledB,LOW);
+      break;
+    case 2: // DS18B20 - BLUE
+      digitalWrite(ledR,LOW); digitalWrite(ledG,LOW); digitalWrite(ledB,HIGH);
+      break;
+    case 3: // PIR - CYAN
+      digitalWrite(ledR,LOW); digitalWrite(ledG,HIGH); digitalWrite(ledB,HIGH);
+      break;
+    default:
+      digitalWrite(ledR,LOW); digitalWrite(ledG,LOW); digitalWrite(ledB,LOW);
+      break;
+  }
+}
+
+// ====================== LCD & Button Task ======================
+void Task_LCD(void * parameter) {
+  (void) parameter;
+  pinMode(btnNext, INPUT_PULLUP);
+  pinMode(btnPrev, INPUT_PULLUP);
+  pinMode(ledR, OUTPUT);
+  pinMode(ledG, OUTPUT);
+  pinMode(ledB, OUTPUT);
+
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+
+  // Hiển thị và LED ban đầu
+  displaySensorRealtime();
+  updateLED(sensorIndex);
+
+  bool lastNext = HIGH;
+  bool lastPrev = HIGH;
+
+  while(true){
+    bool nextState = digitalRead(btnNext);
+    bool prevState = digitalRead(btnPrev);
+
+    if(nextState==LOW && lastNext==HIGH){
+      vTaskDelay(30 / portTICK_PERIOD_MS);
+      if(digitalRead(btnNext)==LOW){
+        sensorIndex = (sensorIndex + 1) % totalSensors;
+        lcd.clear();
+        updateLED(sensorIndex);
+      }
+    }
+    lastNext = nextState;
+
+    if(prevState==LOW && lastPrev==HIGH){
+      vTaskDelay(30 / portTICK_PERIOD_MS);
+      if(digitalRead(btnPrev)==LOW){
+        sensorIndex = (sensorIndex + totalSensors -1) % totalSensors;
+        lcd.clear();
+        updateLED(sensorIndex);
+      }
+    }
+    lastPrev = prevState;
+
+    if(millis() - lastLCDUpdate > lcdInterval){
+      lastLCDUpdate = millis();
+      displaySensorRealtime();
+    }
+
+    vTaskDelay(20 / portTICK_PERIOD_MS);
+  }
+}
+
+// ====================== SETUP ======================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(pirPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+
+  // Wifi
+  WiFi.begin(WIFI_SSID,WIFI_PASSWORD);
+  Serial.print("Connecting WiFi");
+  unsigned long start=millis();
+  while(WiFi.status()!=WL_CONNECTED){
+    Serial.print(".");
+    delay(300);
+    if(millis()-start>20000) break;
+  }
+  if(WiFi.status()==WL_CONNECTED){
+    Serial.println("\nConnected! IP:");
+    Serial.println(WiFi.localIP());
+  }
+
+  // Firebase
+  config.api_key = API_KEY;
+  config.database_url = DATABASE_URL;
+  if(Firebase.signUp(&config,&auth,"","")) signupOK=true;
+  config.token_status_callback = tokenStatusCallback;
+  Firebase.begin(&config,&auth);
+  Firebase.reconnectWiFi(true);
+
+  Wire.begin(21,22);
+
+  if(!pox.begin()){Serial.println("MAX30100 FAILED");} 
+  else {
+    pox.setOnBeatDetectedCallback(onBeatDetected);
+    pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+  }
+
+  dht.begin();
+  ds18b20.begin();
+
+  // Tạo task
+  xTaskCreatePinnedToCore(Task_ReadSensor,"TaskReadSensor",4096,NULL,1,&TaskReadSensor,0);
+  xTaskCreatePinnedToCore(Task_SendFirebase,"TaskSendFirebase",8192,NULL,1,&TaskSendFirebase,1);
+  xTaskCreatePinnedToCore(buzzerTask,"BuzzerTask",4096,NULL,1,&TaskBuzzer,1);
+  xTaskCreatePinnedToCore(Task_LCD,"TaskLCD",4096,NULL,1,&TaskLCD,1);
+}
+
+void loop(){
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
+}

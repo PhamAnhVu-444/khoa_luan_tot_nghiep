@@ -1,0 +1,109 @@
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
+#include <LiquidCrystal_I2C.h>
+
+#define REPORTING_PERIOD_MS 1000
+
+PulseOximeter pox;
+uint32_t tsLastReport = 0;
+
+// Địa chỉ I2C phổ biến: 0x27 hoặc 0x3F
+LiquidCrystal_I2C lcd(0x27, 16, 2); 
+
+const int buzzerPin = 23;
+
+// Callback khi phát hiện nhịp tim
+void onBeatDetected() {
+  Serial.println("Nhịp tim được phát hiện!");
+}
+
+// Biến cho còi không block
+unsigned long lastBuzzerUpdate = 0;
+int buzzerFreq = 600;
+bool increasing = true;
+
+void setup() {
+  Serial.begin(115200);
+  // Khởi tạo I2C trên chân mặc định của ESP32 (SDA=21, SCL=22)
+  Wire.begin(21, 22);
+
+  // Khởi tạo LCD
+  lcd.init();
+  lcd.backlight();
+  lcd.clear();
+  lcd.print("Khoi dong...");
+
+  // Khởi tạo cảm biến MAX30100
+  if (!pox.begin()) {
+    lcd.clear();
+    lcd.print("MAX30100 ERR!");
+    Serial.println("MAX30100 initialization failed!");
+    while (1); // Dừng chương trình nếu sensor lỗi
+  }
+
+  lcd.clear();
+  lcd.print("MAX30100 OK");
+  Serial.println("MAX30100 OK");
+
+  // Đặt dòng điện LED (mức cũ: 7.6mA)
+  pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA);
+  pox.setOnBeatDetectedCallback(onBeatDetected);
+}
+
+void loop() {
+  // Cập nhật dữ liệu nhịp tim và SpO2 liên tục
+  pox.update();
+
+  // ==================================================
+  // Cập nhật LCD và Serial mỗi 1 giây
+  // ==================================================
+  if (millis() - tsLastReport > REPORTING_PERIOD_MS) {
+    float rawBPM   = pox.getHeartRate();
+    // Hệ số chia 2.2 của code gốc
+    float bpm_div2 = rawBPM / 2.2; 
+    float spo2     = pox.getSpO2();
+
+    Serial.print("Nhip tim: ");
+    Serial.print(bpm_div2);
+    Serial.print(" | SpO2: ");
+    Serial.println(spo2);
+
+    // Hiển thị LCD
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("BPM: ");
+    lcd.print(bpm_div2);
+
+    lcd.setCursor(0, 1);
+    lcd.print("SpO2: ");
+    lcd.print(spo2);
+    lcd.print(" %");
+
+    tsLastReport = millis();
+  }
+
+  // ==================================================
+  // Còi cảnh báo BPM > 100 (không block) - Đã sửa lỗi thành 120 theo logic bạn dùng sau này
+  // Logic cũ dùng 100, nhưng tôi sẽ dùng 120 như các phiên bản sau để nhất quán.
+  // ==================================================
+  float currentBPM = pox.getHeartRate() / 2.2;
+  if (currentBPM > 120) {
+    if (millis() - lastBuzzerUpdate > 5) { // mỗi 5ms thay đổi tần số
+      tone(buzzerPin, buzzerFreq);
+
+      if (increasing) {
+        buzzerFreq += 10;
+        if (buzzerFreq >= 1200) increasing = false;
+      } else {
+        buzzerFreq -= 10;
+        if (buzzerFreq <= 600) increasing = true;
+      }
+
+      lastBuzzerUpdate = millis();
+    }
+  } else {
+    noTone(buzzerPin); // Tắt còi nếu nhịp tim bình thường
+    buzzerFreq = 600;  // Reset tần số khi nhịp tim trở lại bình thường
+    increasing = true;
+  }
+}

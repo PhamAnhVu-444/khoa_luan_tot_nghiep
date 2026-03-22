@@ -1,0 +1,31 @@
+// Khai báo chân cho ESP32
+const int pirPin = 2;     // GPIO 2 cho cảm biến PIR
+const int ledPin = 18;    // GPIO 18 cho điều khiển LED
+
+void setup() {
+  // pinMode() và digitalWrite() vẫn hoạt động như cũ trên ESP32
+  pinMode(pirPin, INPUT);
+  pinMode(ledPin, OUTPUT);
+  
+  // Tắt đèn khi khởi động
+  digitalWrite(ledPin, LOW); 
+  
+  Serial.begin(115200); // Thường dùng tốc độ 115200 trên ESP32
+  Serial.println("ESP32 PIR Sensor active. Waiting for motion...");
+}
+
+void loop() {
+  // Đọc giá trị từ cảm biến (HIGH = Có chuyển động)
+  int val = digitalRead(pirPin); 
+
+  // Điều khiển đèn trực tiếp
+  if (val == HIGH) {
+    digitalWrite(ledPin, HIGH); 
+    Serial.println("Motion detected -> LED ON");
+  } else {
+    digitalWrite(ledPin, LOW);
+    Serial.println("No motion -> LED OFF");
+  }
+
+  // Không có lệnh delay() để vòng lặp chạy nhanh nhất có thể.
+}
